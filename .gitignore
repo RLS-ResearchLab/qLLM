@@ -9,11 +9,26 @@ tests/fake_qwen35_small_fused/
 tests/profiling_output/
 qwen35_checkpoint/
 *.tex
-*.csv
-Gpu window checklist.md
-moe_quantization_memo.md
-SESSION_HANDOFF*.md
-H200_test_day_checklist.md
-w8a8_activation_quant*.md
-THROUGHPUT_PUSH_CHECKLIST.md
 report/
+
+# Notes / memos / session handoffs (scratch docs, not curated project docs)
+*.md
+!README.md
+!PICKED_MILESTONES.md
+
+# Benchmark, profiling, and trace run artifacts
+outputs/
+*.csv
+*.log
+*.zip
+*.nsys-rep
+*.sqlite
+*.sqlite-journal
+*_trace*.json
+*_trace*.txt
+*.pid
+
+# Driver scripts (scratch tooling, not part of the shipped setup path)
+*.sh
+!setup.sh
+modal_app.py

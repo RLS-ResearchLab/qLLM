@@ -396,7 +396,14 @@ def health():
         body["error"] = repr(engine_error)
     if _server_config is not None:
         body["config"] = _server_config
-    return JSONResponse(body)
+    # Non-2xx on status=="error" matters: uvicorn stays up and keeps serving
+    # this endpoint even after the engine's background loop has died, so a
+    # 200 here regardless of body content would let `curl -sf` (and every
+    # other 2xx-means-healthy check -- bench_http_concurrency.py's and
+    # gsm8k_http_run.py's urlopen() calls both already treat any raised
+    # HTTPError as FATAL) report a crashed engine as healthy.
+    status_code = 200 if body["status"] == "ok" else 503
+    return JSONResponse(body, status_code=status_code)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
@@ -503,6 +510,14 @@ def main():
                         dest="tensor_parallel_size",
                         help="The path validated in Phase 5 / Phases 4-7 (see README.md "
                              "for current validation status).")
+    parser.add_argument("--dist-init-port", type=int, default=2333,
+                        dest="dist_init_port",
+                        help="dist.init_process_group rendezvous port (engine/model_runner.py). "
+                             "Only matters if you're running MULTIPLE independent server "
+                             "instances on the same machine (e.g. a data-parallel-replica "
+                             "topology, N separate tp=1 servers) -- give each instance a "
+                             "distinct port, or every replica's rank group tries to rendezvous "
+                             "on the same 2333 and collides. Irrelevant for a single server.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         dest="gpu_memory_utilization")
     parser.add_argument("--max-model-len", type=int, default=4096, dest="max_model_len")
@@ -698,6 +713,7 @@ def main():
         "lm_head_int8": args.use_lm_head_int8,
         "lm_head_in_graph": args.use_lm_head_in_graph,
         "moe_w8a8_hopper": args.use_moe_w8a8_hopper,
+        "dist_init_port": args.dist_init_port,
     }
 
     # Loud, launch-time version of the same check bench_http_concurrency.py
@@ -725,6 +741,11 @@ def main():
               f"gather+dequant+einsum path, not the fused Triton kernel. This is NOT the "
               f"204.1 tok/s A6000 configuration. Pass --fused-moe-kernel too unless the "
               f"dequant-only path is deliberately what's being measured.")
+    if args.batched_gdr_decode and args.fused_gdr_decode_kernel:
+        print("[WARNING] both --batched-gdr-decode and --fused-gdr-decode-kernel were passed -- "
+              "--fused-gdr-decode-kernel wins silently (Qwen35LinearAttention.forward() checks "
+              "it first, see its own --help text); --batched-gdr-decode is ignored. Pass only "
+              "one unless this is a deliberate A/B.")
 
     if args.fake_config_loader:
         import nanovllm.config as config_mod
@@ -749,6 +770,7 @@ def main():
         use_lm_head_int8=args.use_lm_head_int8,
         use_lm_head_in_graph=args.use_lm_head_in_graph,
         use_moe_w8a8_hopper=args.use_moe_w8a8_hopper,
+        dist_init_port=args.dist_init_port,
     )
 
     # Added 2026-08-27: real KV-cache block count is only known after

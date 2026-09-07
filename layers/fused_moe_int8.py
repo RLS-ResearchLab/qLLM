@@ -16,10 +16,30 @@ are unverified -- see the flag's own docstring there for exactly what's
 still open before this should be trusted as the default.
 """
 import os
+import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+# Bootstrap the "nanovllm" package alias -- same pattern used throughout this
+# repo (src/server.py, engine/model_runner.py, every tests/*.py file) since
+# this project's own directory isn't named "nanovllm" but internal modules
+# do `from nanovllm.xxx import yyy`. Needed here specifically because this
+# file can also be imported standalone (layers/smoke_test_full_moe_pipeline.py
+# does `from fused_moe_int8 import ...` directly, with no caller having set
+# this shim up first) -- reproduced directly: ModuleNotFoundError: No module
+# named 'nanovllm'. The `"nanovllm" not in sys.modules` guard makes this a
+# no-op when a caller (e.g. src/server.py) already installed the identical
+# shim earlier in the import chain.
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if os.path.basename(_ROOT) != "nanovllm" and "nanovllm" not in sys.modules:
+    import types
+    _nanovllm_pkg = types.ModuleType("nanovllm")
+    _nanovllm_pkg.__path__ = [_ROOT]
+    _nanovllm_pkg.__file__ = os.path.join(_ROOT, "__init__.py")
+    sys.modules["nanovllm"] = _nanovllm_pkg
 
 from nanovllm.layers.moe_align_block_size import moe_align_block_size
 # NOTE: fused_moe_triton does `import triton` at module top -- triton has no
@@ -78,6 +98,41 @@ _DEFAULT_CONFIG = {
     "num_warps": 8,
     "num_stages": 3,
 }
+
+# Decode-only config -- SESSION_HANDOFF_2026-08-28.md open item #3.
+#
+# ATTEMPTED AND REVERTED 2026-09-06 -- a real lesson in why isolate-and-hand-
+# verify matters (see project memory feedback_isolate_and_hand_verify_
+# debugging.md). tune_fused_moe_triton.py's decode-shape sweep found a
+# config measuring 2.49x faster than _DEFAULT_CONFIG in the isolated
+# smoke_test_full_moe_pipeline.py microbenchmark (correctness gate PASS at
+# cosine>0.999). Wiring it into DECODE_CONFIG and re-measuring with the real
+# engine (NUM_REPLICAS=1 ./ddp_replicas_test.sh, same tp=1/concurrency-64/
+# max-tokens-1024 params as the 2043.1 tok/s baseline) gave 1942.5 tok/s --
+# AT OR BELOW the un-retuned baseline, i.e. the isolated win did not
+# transfer and may be a net regression. Reverted to the safe value
+# (identical to _DEFAULT_CONFIG, zero behavior change) below. The isolated
+# microbenchmark's per-call shape/reuse pattern (fresh random weights/
+# routing each call, no CUDA graph capture, no neighboring kernels
+# competing for L2/SM occupancy) evidently doesn't represent what this
+# kernel actually experiences inside a real decode step -- don't trust a
+# future sweep's ranked table without repeating this exact real-engine
+# check before adopting its winner.
+#
+# Original rationale, still true and still the reason this is worth
+# revisiting with a DIFFERENT candidate set or methodology: at the real
+# production decode shape (tp=1/ep_size=1, E=256 local experts, top_k=8,
+# concurrency 64) each expert sees on average only 64*8/256 = 2 tokens, so
+# _DEFAULT_CONFIG's BLOCK_SIZE_M=16 pads that out to a 16-row block computing
+# real work for ~2 of its rows -- roughly 8x wasted M-dimension work in the
+# single kernel that a real torch-profiler decode trace shows as the #1 GPU
+# cost (fused_moe_kernel, ~23% of total kernel time in a 15-decode-step
+# capture, more than 2x the next-largest named kernel). Wired ONLY into
+# models/qwen3_5.py's _forward_gathered (the ep_size=1, decode-only call
+# site) -- deliberately NOT _forward_gathered_ep's call (prefill + EP),
+# which sees a different, larger per-call M and has no config sweep of its
+# own yet.
+DECODE_CONFIG = dict(_DEFAULT_CONFIG)
 
 
 def _tl_compute_type(dtype: torch.dtype):

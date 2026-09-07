@@ -143,7 +143,7 @@ class ModelRunner:
             getattr(torch._dynamo.config, "cache_size_limit", "?"),
             getattr(torch._dynamo.config, "accumulated_recompile_limit", "?")), flush=True)
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", f"tcp://localhost:{config.dist_init_port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -517,6 +517,55 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # Opt-in torch.profiler capture -- added 2026-09-06 as a Modal-
+        # compatible alternative to nsys (confirmed SIGSEGV on Modal for
+        # every profile_milestones.sh entry attempted there, see project
+        # memory project_qllm_h100_session1_modal_1295toks -- not a
+        # copy-back issue, nsys itself never produces anything on that
+        # platform). Same "purely diagnostic, off by default, negligible
+        # cost when unset" posture as the nvtx ranges further down this
+        # function. NANOVLLM_TORCH_PROFILE_STEPS=<N> (default 0 = off)
+        # captures the next N DECODE steps (is_prefill=False) into a
+        # Chrome-trace JSON, viewable at ui.perfetto.dev with no NVIDIA
+        # tooling install needed, unlike nsys/nsys-ui. Rank 0 only --
+        # multi-rank trace merging isn't worth the complexity for a first
+        # look at where time goes. NANOVLLM_TORCH_PROFILE_SKIP=<N> (default
+        # 5) skips that many decode steps first, so the capture window
+        # lands after startup/graph-capture noise has settled, not during it.
+        if not hasattr(self, "_torch_profile_total"):
+            self._torch_profile_total = int(os.environ.get("NANOVLLM_TORCH_PROFILE_STEPS", "0"))
+            self._torch_profile_skip = int(os.environ.get("NANOVLLM_TORCH_PROFILE_SKIP", "5"))
+            self._torch_profile_seen = 0
+            self._torch_profile_captured = 0
+            self._torch_profiler = None
+            self._torch_profile_done = False
+        if (self._torch_profile_total > 0 and self.rank == 0
+                and not is_prefill and not self._torch_profile_done):
+            self._torch_profile_seen += 1
+            if self._torch_profile_seen > self._torch_profile_skip and self._torch_profiler is None:
+                # Must not let a profiler-construction failure crash the
+                # actual decode step -- this runs on the live serving path
+                # for every batch, unlike nsys which wraps the whole process
+                # from outside. torch.profiler's CUDA activity goes through
+                # the same underlying CUPTI machinery nsys uses, and nsys is
+                # CONFIRMED to SIGSEGV on Modal -- if that turns out to be a
+                # CUPTI/driver permission restriction rather than something
+                # nsys-specific, this could hit the same wall. Degrade to
+                # "no trace produced" instead of "server crashes for every
+                # in-flight request", same discipline as the nvtx try/finally
+                # a few lines down.
+                try:
+                    self._torch_profiler = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+                    self._torch_profiler.start()
+                    print(f"[TORCH PROFILE] starting capture of {self._torch_profile_total} decode steps "
+                          f"(skipped first {self._torch_profile_skip})", flush=True)
+                except Exception as e:
+                    print(f"[TORCH PROFILE] failed to start ({e!r}) -- disabling capture, "
+                          f"server continues normally without a trace.", flush=True)
+                    self._torch_profiler = None
+                    self._torch_profile_done = True
+
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures, all_greedy = self.prepare_sample(seqs) if self.rank == 0 else (None, None)
  
@@ -631,6 +680,44 @@ class ModelRunner:
                       f"num_scheduled_tokens={seq.num_scheduled_tokens} num_cached_tokens={seq.num_cached_tokens} "
                       f"num_tokens={seq.num_tokens}")
         reset_context()
+        if self._torch_profiler is not None and not self._torch_profile_done:
+            # Same reasoning as the start-side try/except above -- a failure
+            # here (step/stop/export) must not take down the decode step
+            # that's actually serving real requests. token_ids is already
+            # computed by this point regardless of what happens below.
+            try:
+                # NOT calling .step() here -- found 2026-09-06 after 3 real
+                # runs already used the .step()-based version: without an
+                # explicit `schedule=`, torch.profiler's default schedule
+                # treats EVERY .step() call as completing one full
+                # record-and-clear cycle (confirmed via its own runtime
+                # warning: "Profiler clears events at the end of each
+                # cycle... set acc_events=True"). That's schedule/step
+                # machinery for REPEATED profiling windows -- this is a
+                # single continuous one-shot window (like a plain
+                # `with torch.profiler.profile(...) as prof:` block), which
+                # needs no .step() at all; .start()/.stop() alone already
+                # records everything continuously in between, with no cycle
+                # boundary to accidentally clear. Removing .step() removes
+                # the ambiguity entirely rather than papering over it with
+                # acc_events=True while keeping a call that was never needed.
+                # (The 3 runs that used the old .step()-based version look
+                # consistent with a full multi-second capture based on their
+                # trace file sizes and content, not a single truncated step
+                # -- but this fix removes the doubt for every run after it.)
+                self._torch_profile_captured += 1
+                if self._torch_profile_captured >= self._torch_profile_total:
+                    self._torch_profiler.stop()
+                    out_path = os.environ.get(
+                        "NANOVLLM_TORCH_PROFILE_OUT", os.path.join(os.getcwd(), "torch_profile_trace.json"))
+                    self._torch_profiler.export_chrome_trace(out_path)
+                    print(f"[TORCH PROFILE] captured {self._torch_profile_captured} decode steps -> {out_path} "
+                          f"-- open at ui.perfetto.dev", flush=True)
+                    self._torch_profile_done = True
+            except Exception as e:
+                print(f"[TORCH PROFILE] failed during step/stop/export ({e!r}) -- disabling capture, "
+                      f"server continues normally without a trace.", flush=True)
+                self._torch_profile_done = True
         return token_ids
 
     def allocate_state_slot(self, seq: Sequence) -> None:

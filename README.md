@@ -73,40 +73,28 @@ non-regression in both eager and graph mode, real generated text read under grap
 derivation — every intermediate fix, root causes, and why each number is trusted — is in
 `moe_quantization_memo.md`.
 
+<p align="center">
+<img width="720" src="assets/throughput_progression.png" alt="Throughput progression across every validated milestone, from the 52.7 tok/s bf16 A6000 baseline to 6549.1 tok/s on 4×H100 data-parallel, against the 17-20k tok/s mentor target">
+</p>
+
+<p align="center"><em>Every validated milestone, log-scale, from the A6000 bf16 baseline to the current
+4×H100 ceiling — see <a href="#whats-still-open">What's still open</a> for the gap to the 17-20k tok/s target.</em></p>
+
 ---
 
 ## What's still open
 
-- **tp=4** (GQA kv-head replication) — CPU-validated end to end; real 4-GPU hardware confirmation
-  (NCCL, HF-reference agreement) still pending. Top of `H200_test_day_checklist.md`.
-- **Concurrency=64 doesn't fit on 2×A6000** — confirmed a real memory ceiling (swept
-  `gpu_memory_utilization` across the full plausible range, no working value), not a tuning gap.
-  Expected to lift on H200's 141GB.
-- **Prefill** (`_forward_dispatch_ep`) not yet migrated to the fused INT8 kernel — low priority
-  (~1 of 1025 forward passes per generation).
-- **INT8 weight-only quantization now works at any `tensor_parallel_size`**, not EP-only —
-  `_forward_gathered`/`_forward_dispatch` (the non-EP paths) gained int8 branches mirroring
-  `_forward_gathered_ep`/`_forward_dispatch_ep`'s existing ones, unblocking `use_moe_w8a8=True` at
-  tp=1 (previously an unconditional `AttributeError`). **The fused Triton kernel path
-  (`NANOVLLM_USE_FUSED_MOE_KERNEL=1`) is now also wired up at tp=1** — `_forward_gathered`'s fused
-  branch mirrors `_forward_gathered_ep`'s exactly (that call never touched `ep_rank`/`owned_mask`/
-  `all_reduce` to begin with, so it was already EP-agnostic under the hood). Prefill has no fused
-  path at tp=1 either, matching `_forward_dispatch_ep`, which never had one. **All of this is
-  unvalidated** — written without GPU access, never run.
-- **True W8A8** (activation quantization, not just weights) and **FP8** — blocked on Ampere having no
-  FP8 tensor cores; a real candidate once on H200.
-- **GSM8K answer-termination edge cases** — solves the arithmetic but sometimes doesn't emit a clean,
-  extractable final answer within the token budget.
-- **Batch-composition bf16 sensitivity** — argmax-level token divergence in 2/5 long sequences tested;
-  n=5 is too small to state a rate, needs a larger sample.
-- **`shared_expert` bf16 residual** (~0.6–0.8%, cosine-based) — accepted as bounded, not yet ablated
-  against GSM8K accuracy.
-- **Prefix caching is disabled whenever `StateManager` is active** — permanent, correctness-driven:
-  recurrent state can't be reconstructed from a cached KV prefix.
-- **Round-robin MoE expert sharding** chosen without a measured expert-utilization histogram.
-- Two narrow gaps: `load_model()` only accepts split/HF-style parameter names (not a model's native
-  fused name); `LLMEngine`'s `atexit`-based lifecycle keeps every engine instance alive for the
-  process's life (`del engine` alone never frees GPU memory).
+- **tp=4** — CPU-validated; real-hardware NCCL/HF-reference confirmation pending. Top of `H200_test_day_checklist.md`.
+- **Concurrency=64 doesn't fit on 2×A6000** — real memory ceiling, not a tuning gap. Should lift on H200's 141GB.
+- **Prefill** not migrated to the fused INT8 kernel — low priority (~1 of 1025 forward passes/generation).
+- **INT8 weight-only + fused kernel now wired up at any `tensor_parallel_size`**, not just EP — written and CPU-reasoned only, **unvalidated on GPU**.
+- **True W8A8 (activation quant) and FP8** — blocked on Ampere (no FP8 tensor cores); real candidate on H200.
+- **GSM8K answer-termination edge cases** — arithmetic is right, but doesn't always emit a clean extractable answer in the token budget.
+- **Batch-composition bf16 sensitivity** — argmax divergence in 2/5 long sequences tested; n=5 too small to size the rate.
+- **`shared_expert` bf16 residual** (~0.6–0.8% cosine) — bounded, not yet ablated against GSM8K accuracy.
+- **Prefix caching permanently disabled with `StateManager` active** — recurrent state can't be reconstructed from a cached KV prefix.
+- **Round-robin MoE expert sharding** — no measured expert-utilization histogram behind the choice.
+- **Two narrow gaps** — `load_model()` only accepts split/HF param names, not a fused native name; `LLMEngine`'s `atexit` lifecycle keeps every instance alive until process exit (`del engine` alone doesn't free GPU memory).
 
 See `H200_test_day_checklist.md` for the prioritized plan going into the next hardware window.
 
@@ -133,7 +121,23 @@ tests/           correctness suites — see "Running the test suites" below
                  (incl. gsm8k_full_run.py — GSM8K-CoT correctness gate)
 bench_throughput.py       concurrency-sweep throughput harness (internal engine)
 bench_http_concurrency.py concurrency-sweep throughput harness (HTTP server)
+
+outputs/         gitignored — server/bench logs, CSVs, and profiler traces
+                 (nsys, sqlite) from *_test.sh / *_session.sh driver scripts,
+                 grouped by run. Nothing in here is committed; see below.
 ```
+
+### Run artifacts (`outputs/`)
+
+The `*.sh` driver scripts at the repo root (`h100_session.sh`, `final_test_tp4.sh`,
+`ddp_replicas_test.sh`, `tune_decode_moe.sh`, `profile_milestones.sh`) each produce
+server logs, bench logs/CSVs, and — for profiling runs — `nsys`/`sqlite` traces. All
+of that lands under `outputs/<script>/<run-variant>/` and is gitignored, so the repo
+root stays limited to source and tooling. `.gitignore` also blanket-ignores `*.csv`,
+`*.log`, `*.zip`, `*.nsys-rep`, `*.sqlite`, `*_trace*.json`, and `*.md` (with `README.md`
+and `PICKED_MILESTONES.md` explicitly kept) — curated write-ups like
+`moe_quantization_memo.md`, `THROUGHPUT_PUSH_CHECKLIST.md`, and the `SESSION_HANDOFF_*.md`
+files stay local reference material rather than tracked docs.
 
 ---
 

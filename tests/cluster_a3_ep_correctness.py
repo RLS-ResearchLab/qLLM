@@ -87,6 +87,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from gsm8k_prompt import build_prompt  # noqa: E402
 from cluster_a2_tp_correctness import (  # noqa: E402
     REFERENCE_PATH, PROMPTS, _maybe_install_fake_config_loader, _free_diagnostic_seq,
+    _atomic_torch_save,
 )
 
 DEFAULT_CKPT = os.path.join(ROOT, "qwen35_checkpoint")
@@ -102,8 +103,21 @@ COSINE_SIM_THRESHOLD = 0.99
 HISTOGRAM_NUM_PROMPTS = 64
 
 
-def _engine_path(tp: int) -> str:
-    return os.path.join(CACHE_DIR, f"engine_ep_tp{tp}.pt")
+def _engine_path(tp: int, moe_w8a8: bool = False, fused_moe_kernel: bool = False,
+                  fused_gdr_kernel: bool = False, batched_gdr_decode: bool = False) -> str:
+    # Same reasoning as cluster_a2_tp_correctness.py's _engine_path: the
+    # suffix must reflect every flag that changes the engine's forward path.
+    suffix = ""
+    suffix += "_w8a8" if moe_w8a8 else ""
+    suffix += "_fusedmoe" if fused_moe_kernel else ""
+    suffix += "_fusedgdr" if fused_gdr_kernel else ""
+    suffix += "_batchedgdr" if batched_gdr_decode else ""
+    return os.path.join(CACHE_DIR, f"engine_ep_tp{tp}{suffix}.pt")
+
+
+def _engine_path_for(args) -> str:
+    return _engine_path(args.tp, args.moe_w8a8, args.fused_moe_kernel,
+                         args.fused_gdr_kernel, args.batched_gdr_decode)
 
 
 def phase_engine(args):
@@ -115,12 +129,19 @@ def phase_engine(args):
     noise doesn't contaminate the EP-dispatch-specific comparison) so A3
     tests the EP MECHANISM specifically, not the whole decoder stack."""
     os.makedirs(CACHE_DIR, exist_ok=True)
+    # Module-import-time env var -- must be set before ANY import below that
+    # could transitively pull in models/qwen3_5.py. Same mechanism/reasoning
+    # as cluster_a2_tp_correctness.py's phase_engine and src/server.py.
+    if args.fused_moe_kernel:
+        os.environ["NANOVLLM_USE_FUSED_MOE_KERNEL"] = "1"
     _maybe_install_fake_config_loader(args)
     from nanovllm.llm import LLM
     from nanovllm.engine.sequence import Sequence
     from nanovllm.models.qwen3_5 import Qwen35MoE
 
-    print(f"Constructing engine: tensor_parallel_size={args.tp} (== ep_size) from {args.checkpoint} ...")
+    print(f"Constructing engine: tensor_parallel_size={args.tp} (== ep_size) from {args.checkpoint} ..."
+          f" [moe_w8a8={args.moe_w8a8} fused_moe_kernel={args.fused_moe_kernel} "
+          f"fused_gdr_kernel={args.fused_gdr_kernel} batched_gdr_decode={args.batched_gdr_decode}]")
     llm = LLM(
         args.checkpoint,
         enforce_eager=True,
@@ -128,6 +149,10 @@ def phase_engine(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_num_seqs=len(PROMPTS),
         max_model_len=MAX_MODEL_LEN,
+        use_moe_w8a8=args.moe_w8a8,
+        moe_w8a8_weight_group_size=args.moe_w8a8_group_size,
+        use_fused_gdr_kernel=args.fused_gdr_kernel,
+        use_batched_gdr_decode=args.batched_gdr_decode,
     )
     assert args.tp > 1, (
         f"--tp={args.tp}: EP dispatch (_forward_dispatch_ep/_forward_gathered_ep) is only "
@@ -170,13 +195,14 @@ def phase_engine(args):
         for m, g in zip(moe_modules, saved_gates):
             m.shared_expert_gate.weight.data.copy_(g)
 
-    torch.save({"tp": args.tp, "results": results}, _engine_path(args.tp))
-    print(f"\nSaved EP engine (tp={args.tp}) routed-only results to {_engine_path(args.tp)}")
+    eng_path = _engine_path_for(args)
+    _atomic_torch_save({"tp": args.tp, "results": results}, eng_path)
+    print(f"\nSaved EP engine (tp={args.tp}) routed-only results to {eng_path}")
     print("PHASE COMPLETE -- exit this process fully before running --phase compare")
 
 
 def phase_compare(args):
-    eng_path = _engine_path(args.tp)
+    eng_path = _engine_path_for(args)
     assert os.path.exists(eng_path), f"missing {eng_path} -- run --phase engine --tp {args.tp} first"
     if args.dry_run_no_hf_reference:
         payload = torch.load(eng_path, weights_only=False)
@@ -351,6 +377,29 @@ def main():
                      help="Required against tests/fake_qwen35_small (default OFF -- never needed "
                           "against the real checkpoint). See cluster_a2_tp_correctness.py's "
                           "_AttrDict docstring for why.")
+    ap.add_argument("--moe-w8a8", action="store_true", default=False,
+                     help="Quantize MoE expert weights to INT8 after loading. Only affects "
+                          "--phase engine; pass the SAME flags to --phase compare too, or it "
+                          "computes a different cache path and reports 'missing engine_ep_tp*.pt'. "
+                          "Exists so A3's EP-dispatch check exercises the exact quantization the "
+                          "throughput server runs (_forward_dispatch_ep/_forward_gathered_ep have "
+                          "distinct int8 branches -- plain bf16 EP dispatch passing here says "
+                          "nothing about whether EP dispatch + INT8 dequant is correct together).")
+    ap.add_argument("--moe-w8a8-group-size", type=int, default=128,
+                     help="Group size for INT8 grouped quantization. Only used when --moe-w8a8 "
+                          "is set. See cluster_a2_tp_correctness.py's identical flag.")
+    ap.add_argument("--fused-moe-kernel", action="store_true", default=False,
+                     help="Sets NANOVLLM_USE_FUSED_MOE_KERNEL=1 before nanovllm.llm is imported. "
+                          "Only affects --phase engine. See cluster_a2_tp_correctness.py's "
+                          "identical flag / src/server.py's --fused-moe-kernel help.")
+    ap.add_argument("--fused-gdr-kernel", action="store_true", default=False,
+                     help="Enables fla's chunked Gated Delta Rule PREFILL kernel on linear-"
+                          "attention layers. Only affects --phase engine. Independent of the MoE "
+                          "flags above (different layers), included so this engine matches the "
+                          "throughput server's full flag set, not just its MoE quantization.")
+    ap.add_argument("--batched-gdr-decode", action="store_true", default=False,
+                     help="Enables the batched (Triton-free) DECODE path for linear-attention "
+                          "layers. Only affects --phase engine.")
     args = ap.parse_args()
 
     if args.phase == "engine":

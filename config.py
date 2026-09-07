@@ -11,6 +11,18 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    # Port for the rank group's dist.init_process_group rendezvous
+    # (engine/model_runner.py). Was hardcoded to 2333 until 2026-09-06 --
+    # harmless for a single server instance, but running multiple
+    # INDEPENDENT server processes on the same machine (e.g. the
+    # data-parallel-replica topology: N separate tp=1 servers, one per GPU,
+    # no NCCL between them) had every replica's own process group try to
+    # rendezvous on the exact same "tcp://localhost:2333", which collides --
+    # CUDA_VISIBLE_DEVICES isolates which GPU a replica uses, it does nothing
+    # for this OS-level TCP port. Default unchanged so every existing
+    # single-server invocation behaves identically; only a multi-replica
+    # launcher needs to pass a distinct value per instance.
+    dist_init_port: int = 2333
     enforce_eager: bool = False
     use_fused_gdr_kernel: bool = False
     # Decode-side counterpart to use_fused_gdr_kernel above (that one is

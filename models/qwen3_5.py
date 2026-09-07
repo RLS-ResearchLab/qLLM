@@ -40,7 +40,7 @@ from moe_int8_quantize import dequantize_weight_int8_grouped
 # correctness -- see _USE_FUSED_MOE_KERNEL's own comment below for exactly
 # what's still open. Flag-gated via an env var rather than a proper Config
 # field while still experimental; promote to Config once trusted.
-from nanovllm.layers.fused_moe_int8 import fused_moe_int8_forward
+from nanovllm.layers.fused_moe_int8 import fused_moe_int8_forward, DECODE_CONFIG
 _USE_FUSED_MOE_KERNEL = os.environ.get("NANOVLLM_USE_FUSED_MOE_KERNEL", "0") == "1"
 
 # True W8A8 Hopper fused kernel -- Phase 1/2 of w8a8_activation_quant_scoping_memo.md,
@@ -1326,12 +1326,19 @@ class Qwen35MoE(nn.Module):
             # directly where the EP branch passes `local_slots`. Added
             # alongside the plain-dequant tp=1 fix below, same "unblock
             # tp=1, don't touch EP" scoping.
+            # config=DECODE_CONFIG (not the default None -> _DEFAULT_CONFIG):
+            # this call site (_forward_gathered) is decode-only, ep_size=1 --
+            # see DECODE_CONFIG's own comment in layers/fused_moe_int8.py for
+            # why decode wants its own tuned config. Starts identical to
+            # _DEFAULT_CONFIG, so this is a no-op until DECODE_CONFIG is
+            # actually retuned.
             fused_out_e = fused_moe_int8_forward(
                 x,
                 self.experts.gate_up_proj_int8, self.experts.gate_up_proj_scale,
                 self.experts.down_proj_int8, self.experts.down_proj_scale,
                 self.experts.moe_w8a8_group_size,
                 idx, TK, self.experts.gate_up_proj_int8.shape[0],
+                config=DECODE_CONFIG,
             )
             gate_up = down = None  # unused below when this branch is taken
         elif hasattr(self.experts, "gate_up_proj_int8"):

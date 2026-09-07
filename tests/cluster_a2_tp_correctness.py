@@ -181,9 +181,43 @@ PROMPTS = [
 COSINE_SIM_THRESHOLD = 0.99
 
 
-def _engine_path(tp: int, moe_w8a8: bool = False) -> str:
-    suffix = "_w8a8" if moe_w8a8 else ""
+def _engine_path(tp: int, moe_w8a8: bool = False, fused_moe_kernel: bool = False,
+                  fused_gdr_kernel: bool = False, batched_gdr_decode: bool = False) -> str:
+    # Suffix must reflect every flag that changes the engine's forward path --
+    # otherwise a cached artifact from one kernel combination would get
+    # silently reused (or silently overwrite) a different combination's
+    # result under phase_compare's own path computation.
+    suffix = ""
+    suffix += "_w8a8" if moe_w8a8 else ""
+    suffix += "_fusedmoe" if fused_moe_kernel else ""
+    suffix += "_fusedgdr" if fused_gdr_kernel else ""
+    suffix += "_batchedgdr" if batched_gdr_decode else ""
     return os.path.join(CACHE_DIR, f"engine_tp{tp}{suffix}.pt")
+
+
+def _atomic_torch_save(obj, path: str) -> None:
+    """torch.save straight to `path` leaves a truncated/corrupt file if the
+    process is killed mid-write (SIGTERM from `timeout`, Ctrl-C) -- and
+    every reader here (phase_compare, and final_test_tp4.sh's own REF_CACHE
+    reuse check) only tests os.path.exists(path), so a truncated file would
+    be silently trusted as complete on the next run. Write to a sibling temp
+    file and rename into place -- os.replace is atomic on both POSIX and
+    Windows, so readers only ever see either the old file or a fully-written
+    new one, never a partial one."""
+    tmp_path = path + ".tmp"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _engine_path_for(args) -> str:
+    """Single source of truth for turning parsed args into the 5-way
+    _engine_path() call -- phase_engine and phase_compare must compute the
+    IDENTICAL path from the same flags, and repeating 5 positional args at
+    each call site is exactly the kind of place a copy-paste reorder would
+    silently point compare at the wrong cached artifact."""
+    return _engine_path(args.tp, args.moe_w8a8, args.fused_moe_kernel,
+                         args.fused_gdr_kernel, args.batched_gdr_decode)
+
 
 def phase_reference(args):
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -219,13 +253,20 @@ def phase_reference(args):
             "prefill_logits": prefill_logits, "decode_token_ids": decode_token_ids,
         })
 
-    torch.save({"results": results}, REFERENCE_PATH)
+    _atomic_torch_save({"results": results}, REFERENCE_PATH)
     print(f"\nSaved HF reference to {REFERENCE_PATH}")
     print("PHASE COMPLETE -- exit this process fully before running --phase engine")
 
 
 def phase_engine(args):
     os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # Module-import-time env var (models/qwen3_5.py reads it once, at import
+    # -- see src/server.py's own comment on why `from nanovllm.llm import
+    # LLM` can't happen before this is set). Must be set before ANY import
+    # below that could transitively pull in models/qwen3_5.py.
+    if args.fused_moe_kernel:
+        os.environ["NANOVLLM_USE_FUSED_MOE_KERNEL"] = "1"
 
     import nanovllm.utils.loader as loader_mod
     called_via_default = []
@@ -242,7 +283,9 @@ def phase_engine(args):
     from nanovllm.engine.sequence import Sequence
     from nanovllm.sampling_params import SamplingParams
 
-    print(f"Constructing engine: tensor_parallel_size={args.tp} (== ep_size) from {args.checkpoint} ...")
+    print(f"Constructing engine: tensor_parallel_size={args.tp} (== ep_size) from {args.checkpoint} ..."
+          f" [moe_w8a8={args.moe_w8a8} fused_moe_kernel={args.fused_moe_kernel} "
+          f"fused_gdr_kernel={args.fused_gdr_kernel} batched_gdr_decode={args.batched_gdr_decode}]")
     llm = LLM(
         args.checkpoint,
         enforce_eager=True,
@@ -252,6 +295,8 @@ def phase_engine(args):
         max_model_len=MAX_MODEL_LEN,
         use_moe_w8a8=args.moe_w8a8,
         moe_w8a8_weight_group_size=args.moe_w8a8_group_size,
+        use_fused_gdr_kernel=args.fused_gdr_kernel,
+        use_batched_gdr_decode=args.batched_gdr_decode,
     )
     loader_mod.default_weight_loader = real_default
 
@@ -283,17 +328,18 @@ def phase_engine(args):
             "prefill_logits": prefill_logits.float().cpu(), "decode_token_ids": decode_token_ids,
         })
 
-    torch.save({
+    eng_path = _engine_path_for(args)
+    _atomic_torch_save({
         "tp": args.tp, "results": results,
         "weight_loader_dispatch_default_count": len(called_via_default),
-    }, _engine_path(args.tp, args.moe_w8a8))
-    print(f"\nSaved engine (tp={args.tp}) results to {_engine_path(args.tp, args.moe_w8a8)}")
+    }, eng_path)
+    print(f"\nSaved engine (tp={args.tp}) results to {eng_path}")
     print("PHASE COMPLETE -- exit this process fully before running --phase compare")
 
 
 def phase_compare(args):
     ref_path = REFERENCE_PATH
-    eng_path = _engine_path(args.tp, args.moe_w8a8)
+    eng_path = _engine_path_for(args)
     if args.dry_run_no_hf_reference:
         print("--dry-run-no-hf-reference: SKIPPING comparison against an HF reference (none was "
               "generated -- fake_qwen35_small has random untrained weights, so an HF reference for "
@@ -391,6 +437,22 @@ def main():
                      help="Group size for INT8 grouped quantization. 128 divides both "
                           "hidden_size=2048 and moe_intermediate_size=512 exactly on the real "
                           "checkpoint (Q0). Only used when --moe-w8a8 is set.")
+    ap.add_argument("--fused-moe-kernel", action="store_true", default=False,
+                     help="Sets NANOVLLM_USE_FUSED_MOE_KERNEL=1 before nanovllm.llm is imported "
+                          "(see src/server.py's --fused-moe-kernel help for the mechanism). "
+                          "Only affects --phase engine; pass the SAME flags to --phase compare "
+                          "too, or it computes a different cache path and reports 'missing "
+                          "engine_tp*.pt'. Exists so this script can exercise the exact kernel "
+                          "combination the throughput server actually runs, not just plain bf16 "
+                          "EP dispatch.")
+    ap.add_argument("--fused-gdr-kernel", action="store_true", default=False,
+                     help="Enables fla's chunked Gated Delta Rule kernel for PREFILL on "
+                          "linear-attention layers (see src/server.py's --fused-gdr-kernel help). "
+                          "Only affects --phase engine.")
+    ap.add_argument("--batched-gdr-decode", action="store_true", default=False,
+                     help="Enables the batched (Triton-free) DECODE path for linear-attention "
+                          "layers (see src/server.py's --batched-gdr-decode help). Only affects "
+                          "--phase engine.")
 
     args = ap.parse_args()
 

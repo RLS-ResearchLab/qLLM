@@ -31,6 +31,19 @@ from moe_int8_quantize import (                                  # noqa: E402
     quantize_weight_int8_grouped,
     dequantize_weight_int8_grouped,
 )
+# Config source of truth -- was a hardcoded {BLOCK_SIZE_K=64, num_warps=4,
+# num_stages=2} dict duplicated inline below until 2026-09-06. That dict is
+# _DEFAULT_CONFIG's OWN pre-2026-08-27 value (see fused_moe_int8.py's "Old
+# config, for reference and easy revert" comment) -- this correctness gate
+# had silently kept testing the RETIRED config while every real throughput
+# number since (908/1467/2043.1 tok/s) ran the retuned one, so a config bug
+# introduced by that retune (or by any future one) would not have been
+# caught here. Import the real constants instead so this always exercises
+# whatever is actually shipped, for both the prefill/EP config and the
+# decode-only one (SESSION_HANDOFF_2026-08-28.md item #3 / layers/
+# tune_fused_moe_triton.py) -- identical to each other until that item is
+# actually retuned and DECODE_CONFIG is hand-updated to a real winner.
+from fused_moe_int8 import _DEFAULT_CONFIG, DECODE_CONFIG        # noqa: E402
 
 
 def tl_compute_type(dtype):
@@ -145,48 +158,56 @@ def main():
     prod_warm_s = time.perf_counter() - t0
     print(f"Production pipeline: first={prod_s*1000:.3f}ms  warm={prod_warm_s*1000:.3f}ms")
 
-    # ---- Kernel path ----
-    gu_config = {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2}
-    dp_config = {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2}
-    assert group_size % gu_config["BLOCK_SIZE_K"] == 0
-    assert group_size % dp_config["BLOCK_SIZE_K"] == 0
+    # ---- Kernel path -- BOTH real configs, not one stand-in. Production
+    # (fused_moe_int8_forward) always passes the SAME config to its two
+    # invoke_fused_moe_kernel calls (gate_up GEMM and down_proj GEMM), never
+    # a separate gu/dp pair despite kernel_pipeline()'s signature allowing
+    # it -- gu_config=dp_config=cfg below matches that exactly. ----
+    all_pass = True
+    for label, cfg in (("_DEFAULT_CONFIG (prefill/EP path)", _DEFAULT_CONFIG),
+                        ("DECODE_CONFIG (decode-only path)", DECODE_CONFIG)):
+        assert group_size % cfg["BLOCK_SIZE_K"] == 0, (
+            f"{label}: BLOCK_SIZE_K={cfg['BLOCK_SIZE_K']} does not divide group_size={group_size}"
+        )
+        print(f"\n--- {label}: {cfg} ---")
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    kernel_out = kernel_pipeline(x, gu_i8, gu_sc, dp_i8, dp_sc, group_size, local_slots, top_k,
-                                 gu_config, dp_config, E)
-    torch.cuda.synchronize()
-    kernel_s = time.perf_counter() - t0
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    kernel_out = kernel_pipeline(x, gu_i8, gu_sc, dp_i8, dp_sc, group_size, local_slots, top_k,
-                                 gu_config, dp_config, E)
-    torch.cuda.synchronize()
-    kernel_warm_s = time.perf_counter() - t0
-    print(f"Kernel pipeline:     first={kernel_s*1000:.3f}ms  warm={kernel_warm_s*1000:.3f}ms")
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        kernel_out = kernel_pipeline(x, gu_i8, gu_sc, dp_i8, dp_sc, group_size, local_slots, top_k,
+                                     cfg, cfg, E)
+        torch.cuda.synchronize()
+        kernel_s = time.perf_counter() - t0
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        kernel_out = kernel_pipeline(x, gu_i8, gu_sc, dp_i8, dp_sc, group_size, local_slots, top_k,
+                                     cfg, cfg, E)
+        torch.cuda.synchronize()
+        kernel_warm_s = time.perf_counter() - t0
+        print(f"Kernel pipeline:     first={kernel_s*1000:.3f}ms  warm={kernel_warm_s*1000:.3f}ms")
 
-    # ---- Correctness ----
-    cos = torch.nn.functional.cosine_similarity(
-        prod_out.float().reshape(-1), kernel_out.float().reshape(-1), dim=0
-    ).item()
-    max_abs_err = (prod_out.float() - kernel_out.float()).abs().max().item()
-    print(f"\nCorrectness (kernel pipeline vs. production pipeline): "
-          f"cosine_similarity={cos:.6f}  max_abs_err={max_abs_err:.6f}")
-    print("PASS" if cos > 0.999 else "FAIL -- investigate before trusting this pipeline")
+        # ---- Correctness ----
+        cos = torch.nn.functional.cosine_similarity(
+            prod_out.float().reshape(-1), kernel_out.float().reshape(-1), dim=0
+        ).item()
+        max_abs_err = (prod_out.float() - kernel_out.float()).abs().max().item()
+        print(f"Correctness (kernel pipeline vs. production pipeline): "
+              f"cosine_similarity={cos:.6f}  max_abs_err={max_abs_err:.6f}")
+        passed = cos > 0.999
+        all_pass = all_pass and passed
+        print("PASS" if passed else "FAIL -- investigate before trusting this config")
+
+        print(f"{'='*70}")
+        print(f"{label} -- kernel vs. production, both warm")
+        print(f"{'='*70}")
+        print(f"  Production: {prod_warm_s*1000:.3f} ms")
+        print(f"  Kernel:     {kernel_warm_s*1000:.3f} ms")
+        print(f"  Speedup: {prod_warm_s/kernel_warm_s:.2f}x")
 
     print(f"\n{'='*70}")
-    print("FULL PIPELINE -- kernel vs. production, both warm")
-    print(f"{'='*70}")
-    print(f"  Production: {prod_warm_s*1000:.3f} ms")
-    print(f"  Kernel:     {kernel_warm_s*1000:.3f} ms")
-    print(f"  Speedup: {prod_warm_s/kernel_warm_s:.2f}x")
-    print(f"{'='*70}")
+    print("OVERALL:", "PASS" if all_pass else "FAIL -- see above")
     print("Still not wired into the real engine -- no CUDA graph capture, no EP "
           "ep_rank/owned_mask combine, no all_reduce. This validates the COMPUTE "
-          "pattern is correct and fast in isolation; integration into "
-          "models/qwen3_5.py is the next real step.")
+          "pattern is correct (and, per-config, how fast) in isolation.")
 
 
 if __name__ == "__main__":

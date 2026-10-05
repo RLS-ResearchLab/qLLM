@@ -9,7 +9,6 @@ tests/fake_qwen35_small_fused/
 tests/profiling_output/
 qwen35_checkpoint/
 *.tex
-report/
 
 # Notes / memos / session handoffs (scratch docs, not curated project docs)
 *.md
@@ -32,3 +31,4 @@ outputs/
 *.sh
 !setup.sh
 modal_app.py
+*.pptx

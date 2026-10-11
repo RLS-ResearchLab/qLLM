@@ -4,6 +4,10 @@ __pycache__/
 .vscode/
 tests/_cluster_day_cache/
 tests/_gsm8k_cache/
+# cluster_a2_tp_layerwise.py capture artifacts (engine/HF hidden states).
+# Multi-MB .pt files that are fully reproducible from the three --phase
+# commands; never commit them.
+tests/_phase_b_cache/
 tests/fake_qwen35_small/
 tests/fake_qwen35_small_fused/
 tests/profiling_output/
